@@ -1,7 +1,7 @@
 class EventStatus:
-    UPCOMING = "upcoming"
-    ONGOING = "ongoing"
-    COMPLETED = "completed"
+    UPCOMING = "UPCOMING"
+    ONGOING = "ONGOING"
+    COMPLETED = "COMPLETED"
 
     @classmethod
     def values(cls) -> list[str]:

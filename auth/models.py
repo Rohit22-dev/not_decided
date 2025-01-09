@@ -1,6 +1,8 @@
-from pydantic import BaseModel, EmailStr, constr
-from auth.constants import ValidRoles
 from typing import Optional
+
+from pydantic import BaseModel, EmailStr, constr
+
+from auth.constants import ValidRoles
 
 
 class UserBase(BaseModel):
@@ -19,10 +21,11 @@ class UserCreate(UserBase):
 
 
 class UserResponse(UserBase):
-    id: str
 
     class Config:
         from_attributes = True
+
+    id: str
 
 
 class Token(BaseModel):
