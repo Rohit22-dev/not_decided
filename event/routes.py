@@ -14,6 +14,18 @@ from . import models
 event = APIRouter(dependencies=[Depends(verify_token)])
 
 
+def execute_query(cursor, query, params=None):
+    """Helper function to execute a query and fetch results."""
+    cursor.execute(query, params or ())
+    return cursor.fetchone()
+
+
+def execute_query_fetchall(cursor, query, params=None):
+    """Helper function to execute a query and fetch all results."""
+    cursor.execute(query, params or ())
+    return cursor.fetchall()
+
+
 @event.post("/", response_model=models.EventResponse)
 @db_connection_handler
 async def create_event(
@@ -22,16 +34,17 @@ async def create_event(
     db_conn=Depends(get_postgresql_db),
 ):
     """Create a new event."""
-    organizer_id = user.get("user_id")
-
     query = sql.SQL(
-        """INSERT INTO events (event_name, description, location, start_time, end_time, event_date, organizer_id)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s) 
-                       RETURNING event_id, event_name, description, location, start_time, end_time, event_date, organizer_id,created_at,updated_at;"""
+        """
+        INSERT INTO events (event_name, description, location, start_time, end_time, event_date, organizer_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s) 
+        RETURNING event_id, event_name, description, location, start_time, end_time, event_date, organizer_id, created_at, updated_at;
+        """
     )
-    db_conn.cursor = db_conn.connection.cursor(cursor_factory=RealDictCursor)
-
-    db_conn.cursor.execute(
+    organizer_id = user.get("user_id")
+    cursor = db_conn.connection.cursor(cursor_factory=RealDictCursor)
+    event_data = execute_query(
+        cursor,
         query,
         (
             event.event_name,
@@ -43,48 +56,43 @@ async def create_event(
             organizer_id,
         ),
     )
-    event_data = db_conn.cursor.fetchone()
     db_conn.connection.commit()
     return models.EventResponse(**event_data)
 
 
-@event.get("/", response_model=list[models.EventResponse])
+@event.get("/", response_model=List[models.EventResponse])
 @db_connection_handler
 async def read_events(
     skip: int = 0, limit: int = 10, db_conn=Depends(get_postgresql_db)
 ):
-    """Get all events."""
+    """Get all events with pagination."""
     query = sql.SQL(
-        """SELECT event_id, event_name, description, location, start_time, end_time, event_date, organizer_id, created_at, updated_at
-                       FROM events
-                       LIMIT %s OFFSET %s;"""
+        """
+        SELECT event_id, event_name, description, location, start_time, end_time, event_date, organizer_id, created_at, updated_at
+        FROM events
+        LIMIT %s OFFSET %s;
+        """
     )
-
-    db_conn.cursor = db_conn.connection.cursor(cursor_factory=RealDictCursor)
-
-    # Execute the query with pagination
-    db_conn.cursor.execute(query, (limit, skip))
-    events = db_conn.cursor.fetchall()
-
+    cursor = db_conn.connection.cursor(cursor_factory=RealDictCursor)
+    events = execute_query_fetchall(cursor, query, (limit, skip))
     return [models.EventResponse(**event) for event in events]
 
 
 @event.get("/{event_id}", response_model=models.EventResponse)
 @db_connection_handler
 async def read_event(event_id: str, db_conn=Depends(get_postgresql_db)):
+    """Get details of a specific event."""
     query = sql.SQL(
-        """SELECT event_id, event_name, description, location, start_time, end_time, event_date, organizer_id, created_at, updated_at
-                       FROM events WHERE event_id = %s;"""
+        """
+        SELECT event_id, event_name, description, location, start_time, end_time, event_date, organizer_id, created_at, updated_at
+        FROM events
+        WHERE event_id = %s;
+        """
     )
-
-    db_conn.cursor = db_conn.connection.cursor(cursor_factory=RealDictCursor)
-    db_conn.cursor.execute(query, (event_id,))
-
-    event = db_conn.cursor.fetchone()
-    # If no event is found, raise a 404 HTTPException
-    if event is None:
+    cursor = db_conn.connection.cursor(cursor_factory=RealDictCursor)
+    event = execute_query(cursor, query, (event_id,))
+    if not event:
         raise HTTPException(status_code=404, detail="Event not found")
-
     return models.EventResponse(**event)
 
 
@@ -94,16 +102,17 @@ async def update_event(
     event_id: str, event: models.EventUpdate, db_conn=Depends(get_postgresql_db)
 ):
     """Update a specific event."""
-
     query = sql.SQL(
-        """UPDATE events
-                       SET event_name = %s, description = %s, location = %s, start_time = %s, end_time = %s, event_date = %s
-                       WHERE event_id = %s
-                       RETURNING event_id, event_name, description, location, start_time, end_time, event_date, organizer_id, created_at, updated_at;"""
+        """
+        UPDATE events
+        SET event_name = %s, description = %s, location = %s, start_time = %s, end_time = %s, event_date = %s
+        WHERE event_id = %s
+        RETURNING event_id, event_name, description, location, start_time, end_time, event_date, organizer_id, created_at, updated_at;
+        """
     )
-
-    db_conn.cursor = db_conn.connection.cursor(cursor_factory=RealDictCursor)
-    db_conn.cursor.execute(
+    cursor = db_conn.connection.cursor(cursor_factory=RealDictCursor)
+    updated_event = execute_query(
+        cursor,
         query,
         (
             event.event_name,
@@ -115,13 +124,8 @@ async def update_event(
             event_id,
         ),
     )
-
-    updated_event = db_conn.cursor.fetchone()
-
-    # If no event was updated, raise a 404 HTTPException
-    if updated_event is None:
+    if not updated_event:
         raise HTTPException(status_code=404, detail="Event not found")
-
     return models.EventResponse(**updated_event)
 
 
@@ -129,17 +133,11 @@ async def update_event(
 @db_connection_handler
 async def delete_event(event_id: str, db_conn=Depends(get_postgresql_db)):
     """Delete a specific event."""
-    # TODO: Delete is not working
-    query = sql.SQL("""DELETE FROM events WHERE event_id = %s RETURNING event_id;""")
-
-    db_conn.cursor = db_conn.connection.cursor(cursor_factory=RealDictCursor)
-    db_conn.cursor.execute(query, (event_id,))
-    deleted_event = db_conn.cursor.fetchone()
-
-    # If no event was deleted, raise a 404 HTTPException
-    if deleted_event is None:
+    query = sql.SQL("DELETE FROM events WHERE event_id = %s RETURNING event_id;")
+    cursor = db_conn.connection.cursor(cursor_factory=RealDictCursor)
+    deleted_event = execute_query(cursor, query, (event_id,))
+    if not deleted_event:
         raise HTTPException(status_code=404, detail="Event not found")
-
     return {"message": "Event deleted successfully"}
 
 
@@ -152,10 +150,9 @@ async def create_review(
     db=Depends(get_mongo_db),
 ):
     """Add a review for a specific event."""
-    user_id = user.get("user_id")
     review_data = {
         "event_id": event_id,
-        "user_id": user_id,
+        "user_id": user.get("user_id"),
         "rating": review.rating,
         "comment": review.comment,
         "created_at": review.created_at,

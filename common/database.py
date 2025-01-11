@@ -11,14 +11,14 @@ load_dotenv()
 # DATABASE_URL = "postgresql://postgres:rk220101@localhost:5432/not_decided"
 # REDIS_HOST = "localhost"
 # REDIS_PORT = "6379"
-MONGODB_URL = "mongodb://localhost:27017/not_decided"
+# MONGODB_URL = "mongodb://localhost:27017/not_decided"
 
 
 DATABASE_URL = os.getenv("POSTGRES_DATABASE_URL")
 REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PORT = os.getenv("REDIS_PORT")
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
-# MONGODB_URL = os.getenv("MONGODB_URL")
+MONGODB_URL = os.getenv("MONGODB_URL")
 
 
 class DatabaseConnection:
@@ -44,7 +44,7 @@ class DatabaseConnection:
         try:
             self.cursor.close()
             self.connection.close()
-            print("Database connection closed")
+            print("PostgreSQL connection closed")
         except psycopg2.Error as e:
             print(f"Error closing database connection: {e}")
 
@@ -85,8 +85,18 @@ class RedisConnection:
         try:
             if hasattr(self, "connection") and self.connection:
                 self.connection.close()
+            print("Redis connection closed")
         except redis.ConnectionError as e:
             print(f"Error closing Redis connection: {e}")
+
+
+def get_redis_connection():
+    """Provide a Redis connection."""
+    redis_conn = RedisConnection()
+    try:
+        yield redis_conn.connection
+    finally:
+        redis_conn.close()
 
 
 class MongoDBConnection:
@@ -99,9 +109,10 @@ class MongoDBConnection:
             try:
                 # Establish MongoDB connection using MongoClient
                 cls._instance.client = MongoClient(MONGODB_URL)
-                cls._instance.db = (
-                    cls._instance.client.get_database()
-                )  # Default database from the URL
+                database_name = os.getenv("MONGODB_DATABASE", "default_db")
+                cls._instance.db = cls._instance.client[
+                    database_name
+                ]  # Default database from the URL
                 print("MongoDB connection established")
             except Exception as e:
                 print(f"MongoDB connection failed: {e}")

@@ -3,7 +3,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import jwt
-import psycopg2
 import redis
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -11,11 +10,12 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
-from sqlalchemy.orm import Session
 
+from auth.constants import ACCESS_TOKEN_EXPIRE_MINUTES, ALGORITHM, SECRET_KEY
 from auth.models import Token, UserCreate, UserResponse
 from common.auth_utils import verify_token
-from common.database import DatabaseConnection, RedisConnection
+from common.database import get_postgresql_db, get_redis_connection
+from common.helpers import db_connection_handler
 
 load_dotenv()
 auth = APIRouter()
@@ -24,10 +24,6 @@ REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 REDIS_PORT = os.getenv("REDIS_PORT")
 
-# Move these to environment variables in production
-SECRET_KEY = "1e9356e2ef00d712c017be0e7f5e8ae5da1fa4f60522cc35638148566f0932f9"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
@@ -63,33 +59,28 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
         )
 
 
-def get_user_from_db(email: str, db: Session) -> Optional[UserResponse]:
-    try:
-        db_conn = DatabaseConnection()
-        query = sql.SQL(
-            """
-            SELECT u.user_id, u.username, u.email, r.role_name 
-            FROM users u
-            JOIN roles r ON u.role_id = r.role_id
-            WHERE u.email = %s
+@db_connection_handler
+def get_user_from_db(
+    email: str, db_conn=Depends(get_postgresql_db)
+) -> Optional[UserResponse]:
+    query = sql.SQL(
         """
-        )
-        db_conn.cursor.execute(query, (email,))
-        user = db_conn.cursor.fetchone()
-
-        if user:
-            return UserResponse(id=user[0], name=user[1], email=user[2], role=user[3])
-        return None
-    except psycopg2.Error as e:
-        print(f"Database query failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database error occurred",
-        )
+        SELECT u.user_id, u.username, u.email, r.role_name 
+        FROM users u
+        JOIN roles r ON u.role_id = r.role_id
+        WHERE u.email = %s
+    """
+    )
+    db_conn.cursor.execute(query, (email,))
+    user = db_conn.cursor.fetchone()
+    if user:
+        return UserResponse(id=user[0], name=user[1], email=user[2], role=user[3])
+    return None
 
 
 @auth.post("/register", response_model=UserResponse)
-async def register_user(user: UserCreate):
+@db_connection_handler
+async def register_user(user: UserCreate, db_conn=Depends(get_postgresql_db)):
     try:
         user.validate_role()
     except ValueError as e:
@@ -101,98 +92,76 @@ async def register_user(user: UserCreate):
             status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered"
         )
 
-    db_conn = DatabaseConnection()
-    try:
-        # Get the role_id corresponding to the role_name
-        query = sql.SQL("SELECT role_id FROM roles WHERE role_name = %s")
-        db_conn.cursor.execute(query, (user.role,))
-        role = db_conn.cursor.fetchone()
-
-        if not role:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role"
-            )
-
-        role_id = role[0]
-        hashed_password = get_password_hash(user.password)
-
-        query = sql.SQL(
-            """
-            INSERT INTO users (username, email, role_id, password_hash)
-            VALUES (%s, %s, %s, %s)
-            RETURNING user_id, username, email, role_id
-        """
-        )
-        db_conn.cursor.execute(query, (user.name, user.email, role_id, hashed_password))
-        new_user_data = db_conn.cursor.fetchone()
-        db_conn.connection.commit()
-
-        return UserResponse(
-            id=new_user_data[0],
-            name=new_user_data[1],
-            email=new_user_data[2],
-            role=user.role,
-        )
-    except psycopg2.Error as e:
-        db_conn.connection.rollback()
-        print(f"User registration failed: {e}")
+    # Get the role_id corresponding to the role_name
+    query = sql.SQL("SELECT role_id FROM roles WHERE role_name = %s")
+    db_conn.cursor.execute(query, (user.role,))
+    role = db_conn.cursor.fetchone()
+    if not role:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to register user",
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role"
         )
-    # finally:
-    #     db_conn.close()
+    role_id = role[0]
+    hashed_password = get_password_hash(user.password)
+    query = sql.SQL(
+        """
+        INSERT INTO users (username, email, role_id, password_hash)
+        VALUES (%s, %s, %s, %s)
+        RETURNING user_id, username, email, role_id
+    """
+    )
+    db_conn.cursor.execute(query, (user.name, user.email, role_id, hashed_password))
+    new_user_data = db_conn.cursor.fetchone()
+    db_conn.connection.commit()
+    return UserResponse(
+        id=new_user_data[0],
+        name=new_user_data[1],
+        email=new_user_data[2],
+        role=user.role,
+    )
 
 
 @auth.post("/login", response_model=Token)
-async def login_user(form_data: OAuth2PasswordRequestForm = Depends()):
-    try:
-        db_conn = DatabaseConnection()
-        redis_client = RedisConnection().connection
-        query = sql.SQL("SELECT user_id, password_hash FROM users WHERE email = %s")
-        db_conn.cursor = db_conn.connection.cursor(cursor_factory=RealDictCursor)
-        db_conn.cursor.execute(query, (form_data.username,))
-        user_data = db_conn.cursor.fetchone()
-
-        if not user_data or not verify_password(
-            form_data.password, user_data.get("password_hash")
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        access_token = create_access_token(
-            data={"email": form_data.username, "user_id": user_data.get("user_id")},
+@db_connection_handler
+async def login_user(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db_conn=Depends(get_postgresql_db),
+    redis_client=Depends(get_redis_connection),
+):
+    query = sql.SQL("SELECT user_id, password_hash FROM users WHERE email = %s")
+    db_conn.cursor = db_conn.connection.cursor(cursor_factory=RealDictCursor)
+    db_conn.cursor.execute(query, (form_data.username,))
+    user_data = db_conn.cursor.fetchone()
+    if not user_data or not verify_password(
+        form_data.password, user_data.get("password_hash")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-
-        # Store token in Redis with error handling
-        try:
-            redis_client.set(
-                form_data.username, access_token, ex=ACCESS_TOKEN_EXPIRE_MINUTES * 60
-            )
-        except redis.RedisError as e:
-            print(f"Redis operation failed: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Session management error",
-            )
-
-        return {"access_token": access_token, "token_type": "bearer"}
-    except psycopg2.Error as e:
-        print(f"Database query failed: {e}")
+    access_token = create_access_token(
+        data={"email": form_data.username, "user_id": user_data.get("user_id")},
+    )
+    # Store token in Redis with error handling
+    try:
+        redis_client.set(
+            form_data.username, access_token, ex=ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        )
+    except redis.RedisError as e:
+        print(f"Redis operation failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database error occurred",
+            detail="Session management error",
         )
-    # finally:
-    #     db_conn.close()
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 @auth.post("/logout")
-async def logout_user(token_payload: str = Depends(verify_token)):
+async def logout_user(
+    token_payload: str = Depends(verify_token),
+    redis_client=Depends(get_redis_connection),
+):
     try:
-        redis_client = RedisConnection().connection
         email = token_payload.get("email")
         if not email:
             raise HTTPException(
@@ -220,9 +189,11 @@ async def logout_user(token_payload: str = Depends(verify_token)):
 
 
 @auth.get("/me", response_model=UserResponse)
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    redis_client=Depends(get_redis_connection),
+):
     try:
-        redis_client = RedisConnection().connection
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
         if not email:
